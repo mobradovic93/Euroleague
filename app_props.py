@@ -11,7 +11,7 @@ st.markdown("""
 <style>
     .stApp { background-color: #0b0e14; }
     div[data-testid="stSidebar"] { background-color: #10141d; }
-    .block-container { padding-top: 1.5rem; }
+    .block-container { padding-top: 4rem; }
 
     .player-card {
         display: flex; align-items: center; gap: 18px;
@@ -22,6 +22,7 @@ st.markdown("""
     .player-photo-wrap { position: relative; width: 64px; height: 64px; flex-shrink: 0; }
     .player-photo-wrap .headshot {
         width: 64px; height: 64px; border-radius: 50%; object-fit: cover;
+        object-position: 50% 12%;
         background: #1b2131; border: 2px solid #2a3245;
     }
     .player-photo-wrap .team-badge {
@@ -162,6 +163,16 @@ def load_data():
             'Steals', 'Blocks', 'BlocksAgainst', 'Turnovers', 'FoulsCommited',
             'Valuation', 'Plusminus', 'PRA', 'PR', 'PA', 'RA', 'Stocks']
     return df[keep].sort_values('Date', ascending=False).reset_index(drop=True)
+
+
+def snap_line_to_half():
+    """Keep the line on a .5 grid (8.5, not 8.0 or 9.0) even after direct typing.
+    Must run as an on_change callback: Streamlit forbids mutating a widget's own
+    session_state key from the main script body once that widget is instantiated.
+    """
+    val = st.session_state.get("sb_line_val")
+    if val is not None and val == int(val):
+        st.session_state["sb_line_val"] = val + 0.5
 
 
 def get_opponent(matchup_str, player_team):
@@ -331,24 +342,22 @@ def main():
     with col_line:
         cur_max = float(pdf[stat_col].max()) if not pdf.empty else 10.0
         default_line = min(10.5, max(cur_max / 2, 0.5))
-        line = st.number_input("Line:", min_value=0.0, max_value=max(cur_max + 5, 5.0),
+        default_line = int(default_line) + 0.5  # lines always sit on a .5, e.g. 8.5 not 8.0 or 9.0
+        line = st.number_input("Line:", min_value=0.5, max_value=max(cur_max + 5, 5.5),
                                 value=float(st.session_state.get("sb_line_val", default_line)),
-                                step=0.5, key="sb_line_val")
+                                step=0.5, key="sb_line_val", on_change=snap_line_to_half)
     with col_n:
         total_found = len(pdf)
         num_games = st.number_input("Sample size (last N games):", min_value=1,
                                      max_value=max(total_found, 1),
-                                     value=min(20, total_found), step=1, key="sb_num_games")
+                                     value=min(10, total_found), step=1, key="sb_num_games")
 
     sample = pdf.head(int(num_games)).copy()
 
     # --- HIT RATE SPLITS ---
     st.write("")
     split_defs = [
-        ("L5", pdf.head(5)),
-        ("L10", pdf.head(10)),
-        ("L15", pdf.head(15)),
-        ("L20", pdf.head(20)),
+        ("FILTERED", sample),
         ("SEASON", pdf),
         ("HOME", pdf[pdf['Venue'] == 'Home']),
         ("AWAY", pdf[pdf['Venue'] == 'Away']),
@@ -363,6 +372,10 @@ def main():
     hits_n = int((sample[stat_col] > line).sum())
     total_n = len(sample)
     hit_rate = hits_n / total_n * 100 if total_n else 0
+    fga = sample['TwoPA'] + sample['ThreePA']
+    fgm = sample['TwoPM'] + sample['ThreePM']
+    avg_fga = fga.mean() if total_n else 0.0
+    fg_pct = (fgm.sum() / fga.sum() * 100) if fga.sum() else 0.0
     st.markdown(f"""
     <div style="background-color:#131826;border:1px solid #232a38;border-radius:14px;padding:16px 24px;margin-top:14px;">
         <span class="market-pill">{market_label}</span>
@@ -373,6 +386,8 @@ def main():
             <div class="stat-box"><div class="v">{sample[stat_col].mean():.1f}</div><div class="l">AVG {market_label.upper()}</div></div>
             <div class="stat-box"><div class="v">{sample[stat_col].median():.1f}</div><div class="l">MEDIAN</div></div>
             <div class="stat-box"><div class="v">{sample['Minutes_Numeric'].mean():.1f}</div><div class="l">AVG MIN</div></div>
+            <div class="stat-box"><div class="v">{avg_fga:.1f}</div><div class="l">AVG FGA</div></div>
+            <div class="stat-box"><div class="v">{fg_pct:.1f}%</div><div class="l">FG%</div></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
