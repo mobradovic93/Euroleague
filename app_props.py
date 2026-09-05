@@ -358,6 +358,8 @@ def main():
     st.write("")
     split_defs = [
         ("FILTERED", sample),
+        ("L5", pdf.head(5)),
+        ("L10", pdf.head(10)),
         ("SEASON", pdf),
         ("HOME", pdf[pdf['Venue'] == 'Home']),
         ("AWAY", pdf[pdf['Venue'] == 'Away']),
