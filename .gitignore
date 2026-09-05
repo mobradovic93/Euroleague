@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Old/scratch copies, not part of the app
+app - Copy.py
+app - Copy (2).py
+EuroleagueToDo.xlsx
+teams.xlsx
+
+# Intermediate per-season files produced by the notebook pipeline and
+# superseded/merged data files -- only boxscores.csv, boxscores_final.csv,
+# players.csv and teams.csv are actually read by the apps.
+boxscores_20[0-9][0-9].csv
+boxscores_20[0-9][0-9]_merged.csv

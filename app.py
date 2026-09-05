@@ -22,42 +22,66 @@ def get_hit_rate_color(percentage):
 @st.cache_data
 def load_data():
     try:
-        df = pd.read_csv('boxscores_2024_merged.csv')
+        df = pd.read_csv('boxscores_final.csv')
         # Konverzija datuma
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         
-        # Izračunavanje FGA (sabiramo pokušaje za 2 i za 3)
-        if 'FieldGoalsAttempted2' in df.columns and 'FieldGoalsAttempted3' in df.columns:
-            df['FGA'] = df['FieldGoalsAttempted2'] + df['FieldGoalsAttempted3']
-        else:
-            df['FGA'] = 0
-            
-        # Sređivanje minuta
-        def parse_min(x):
+        # Čišćenje imena igrača i timova
+        df['Player'] = df['Player'].str.strip() if 'Player' in df.columns else "Unknown"
+        df['TeamName'] = df['TeamName'].str.strip() if 'TeamName' in df.columns else "Unknown"
+        
+        # Parsiranje minuta (iz stringa u float)
+        def parse_minutes(x):
             try:
                 s = str(x).strip()
                 if ':' in s:
-                    p = s.split(':')
-                    return int(p[0]) + int(p[1])/60
-                return 0.0 if s.upper() in ['DNP', 'DSR', 'NAN'] else float(s)
-            except: return 0.0
+                    parts = s.split(':')
+                    return int(parts[0]) + int(parts[1])/60
+                return float(s) if s and s.upper() not in ['DNP', 'DSR', 'NAN', ''] else 0.0
+            except:
+                return 0.0
         
-        if 'Minutes' in df.columns:
-            df['MIN_NUMERIC'] = df['Minutes'].apply(parse_min)
-        else:
-            df['MIN_NUMERIC'] = 0.0
+        df['Minutes_Numeric'] = df['Minutes'].apply(parse_minutes)
         
-        # Protivnik i lokacija
-        if 'hometeam' in df.columns and 'awayteam' in df.columns:
-            df['Opponent'] = df.apply(lambda row: row['awayteam'] if row['Home'] == 1 else row['hometeam'], axis=1)
-            df['Venue'] = df['Home'].apply(lambda x: 'Home' if x == 1 else 'Away')
+        # Derivacija Venue-a iz Matchup-a
+        # Ako Matchup počinje sa TeamName, to je "Home" (vs format)
+        # Ako nema TeamName na početku, to je "Away" (@ format)
+        df['Venue'] = df.apply(
+            lambda row: 'Home' if pd.notna(row['TeamName']) and pd.notna(row['Matchup']) and str(row['Matchup']).startswith(str(row['TeamName'])) else 'Away',
+            axis=1
+        )
         
-        df['Player'] = df['Player'].str.strip() if 'Player' in df.columns else "Unknown"
-        df['Team'] = df['Team'].str.strip() if 'Team' in df.columns else "Unknown"
         return df
     except Exception as e:
         st.error(f"Greška pri učitavanju fajla: {e}")
         return None
+
+def get_team_options_with_images(df):
+    """Kreira options za timove sa njihovim logotipima"""
+    team_data = df[['TeamName', 'TeamImageUrl']].drop_duplicates().set_index('TeamName')['TeamImageUrl'].to_dict()
+    return team_data
+
+def get_opponent_from_matchup(matchup_str, player_team):
+    """Ekstraktuje naziv protivničkog tima iz Matchup stringa"""
+    if pd.isna(matchup_str) or pd.isna(player_team):
+        return None
+    
+    matchup = str(matchup_str).strip()
+    player_team = str(player_team).strip()
+    
+    # Očekivani formati: "TEAM1 vs TEAM2" ili "TEAM1 @ TEAM2"
+    for separator in [' vs ', ' vs. ', ' @ ']:
+        if separator in matchup:
+            parts = [p.strip() for p in matchup.split(separator)]
+            if len(parts) == 2:
+                team1, team2 = parts
+                # Vrati protivnika
+                if team1 == player_team:
+                    return team2
+                elif team2 == player_team:
+                    return team1
+    
+    return None
 
 def main():
     df = load_data()
@@ -69,52 +93,90 @@ def main():
     
     st.sidebar.header("🏀 Selekcija")
     
-    all_teams = sorted(df['Team'].dropna().unique())
-    selected_team = st.sidebar.selectbox("1. Izaberi Tim:", ["Svi timovi"] + all_teams, key="sb_team")
+    player_options = (
+        df.sort_values('Date', ascending=False)
+        .dropna(subset=['Player', 'TeamName'])
+        .drop_duplicates(subset=['Player'], keep='first')
+        [['Player', 'TeamName']]
+    )
+    player_options = {
+        f"{row['Player']} - {row['TeamName']}": (row['Player'], row['TeamName'])
+        for _, row in player_options.sort_values(['Player', 'TeamName']).iterrows()
+    }
+    selected_player_option = st.sidebar.selectbox(
+        "Izaberi Igrača:",
+        list(player_options),
+        key="sb_player"
+    )
+    selected_player, player_team = player_options[selected_player_option]
     
-    t_df = df[df['Team'] == selected_team] if selected_team != "Svi timovi" else df
-    available_players = sorted(t_df['Player'].dropna().unique())
-    selected_player = st.sidebar.selectbox("2. Izaberi Igrača:", available_players, key="sb_player")
-    
-    # Podaci za selektovanog igrača
-    pdf = df[df['Player'] == selected_player].copy()
-    pdf = pdf.sort_values('date', ascending=False)
+    # Podaci za selektovanog igrača i njegov tim
+    pdf = df[
+        (df['Player'] == selected_player) &
+        (df['TeamName'] == player_team)
+    ].copy()
+    pdf = pdf.sort_values('Date', ascending=False)
 
     st.sidebar.markdown("---")
     st.sidebar.header("🛠️ Kumulativni Filteri")
 
-    # 1. On/Off Saigrač
-    player_team = pdf['Team'].iloc[0] if not pdf.empty else ""
-    teammates = sorted(df[(df['Team'] == player_team) & (df['Player'] != selected_player)]['Player'].unique())
-    exclude_teammate = st.sidebar.selectbox("Isključi saigrača (ako je DNP):", ["Niko"] + teammates, key="sb_teammate")
-    
-    if exclude_teammate != "Niko":
-        absent_games = df[(df['Player'] == exclude_teammate) & (df['MIN_NUMERIC'] == 0)]['Gamecode'].unique()
-        pdf = pdf[pdf['Gamecode'].isin(absent_games)]
+    # 1. On/Off Saigrač (Multiselect)
+    teammates = sorted(df[(df['TeamName'] == player_team) & (df['Player'] != selected_player)]['Player'].unique())
+    exclude_teammates = st.sidebar.multiselect("Isključi saigrače:", teammates, key="sb_teammates")
 
     # 2. Lokacija
     venue_choice = st.sidebar.radio("Lokacija:", ['Sve', 'Home', 'Away'], key="sb_venue")
     if venue_choice != 'Sve':
         pdf = pdf[pdf['Venue'] == venue_choice]
 
-    # 3. Protivnik
-    all_opps = sorted(pdf['Opponent'].dropna().unique())
-    selected_opps = st.sidebar.multiselect("Vs Team (Protivnik):", ["Svi"] + all_opps, default=["Svi"], key="sb_opps")
-    if "Svi" not in selected_opps and len(selected_opps) > 0:
-        pdf = pdf[pdf['Opponent'].isin(selected_opps)]
-
-    # 4. Minute (Sigurnosna provera)
+    # 3. Minutaža
     if not pdf.empty:
-        m_min = float(pdf['MIN_NUMERIC'].min())
-        m_max = float(pdf['MIN_NUMERIC'].max())
-        if m_min < m_max:
-            st.sidebar.slider("Minutaža:", m_min, m_max, (m_min, m_max), key="sb_mins")
-            s_min, s_max = st.session_state.get("sb_mins", (m_min, m_max))
-            pdf = pdf[(pdf['MIN_NUMERIC'] >= s_min) & (pdf['MIN_NUMERIC'] <= s_max)]
-        else:
-            st.sidebar.info(f"Fiksna minutaža: {m_min:.1f}")
+        minutes_min = int(pdf['Minutes_Numeric'].min())
+        minutes_max = int(pdf['Minutes_Numeric'].max())
+        if minutes_min < minutes_max:
+            selected_minutes = st.sidebar.slider(
+                "Minuta odigranih:",
+                minutes_min,
+                minutes_max,
+                (minutes_min, minutes_max),
+                key="sb_minutes"
+            )
+            pdf = pdf[pdf['Minutes_Numeric'].between(*selected_minutes)]
 
-    # 5. Broj poslednjih utakmica (Fix za Slider grešku)
+    # 4. Protivnik
+    # Ekstraktuj imena protivničkih timova iz matchupa
+    pdf_temp = pdf.copy()
+    pdf_temp['Opponent'] = pdf_temp.apply(
+        lambda row: get_opponent_from_matchup(row['Matchup'], row['TeamName']),
+        axis=1
+    )
+    
+    all_opponents = sorted([opp for opp in pdf_temp['Opponent'].dropna().unique() if opp])
+    
+    def on_opponents_change():
+        if "sb_opponents" in st.session_state:
+            selection = st.session_state["sb_opponents"]
+            if len(selection) > 1:
+                if selection[-1] == "Svi":
+                    st.session_state["sb_opponents"] = ["Svi"]
+                elif "Svi" in selection:
+                    st.session_state["sb_opponents"] = [x for x in selection if x != "Svi"]
+
+    selected_opponents = st.sidebar.multiselect(
+        "Protivnik:", 
+        ["Svi"] + all_opponents, 
+        default=["Svi"], 
+        key="sb_opponents",
+        on_change=on_opponents_change
+    )
+    
+    if "Svi" not in selected_opponents and len(selected_opponents) > 0:
+        pdf = pdf[pdf.apply(
+            lambda row: get_opponent_from_matchup(row['Matchup'], row['TeamName']) in selected_opponents,
+            axis=1
+        )]
+
+    # 5. Broj poslednjih utakmica
     total_found = len(pdf)
     if total_found > 1:
         num_games = st.sidebar.slider("Poslednjih utakmica:", 1, total_found, min(10, total_found), key="sb_num_games")
@@ -124,8 +186,7 @@ def main():
     
     # --- KONTROLE U GLAVNOM DELU ---
     chart_stats = {
-        'Poeni': 'Points', 'Asistencije': 'Assistances', 'Skokovi': 'TotalRebounds', 
-        '3PM': 'FieldGoalsMade3', 'Minuti': 'MIN_NUMERIC', 'FGA': 'FGA'
+        'Poeni': 'Points', 'Asistencije': 'Assists', 'Skokovi': 'Rebounds'
     }
     
     col_s, col_l = st.columns(2)
@@ -137,10 +198,34 @@ def main():
         if not pdf.empty:
             curr_max = float(pdf[selected_col].max())
             s_max = max(curr_max + 0.5, 1.5)
-            st.slider(f"Granica:", 0.5, s_max, 10.5, 1.0, key="sb_threshold")
-            threshold = st.session_state.get("sb_threshold", 10.5)
+            default_threshold = min(10.5, s_max)
+            st.slider("Granica:", 0.5, s_max, default_threshold, 1.0, key="sb_threshold")
+            threshold = st.session_state.get("sb_threshold", default_threshold)
         else:
             threshold = 10.5
+
+    # Zasebne granice za bojenje statistika u tabeli
+    category_thresholds = {}
+    threshold_labels = {
+        'Points': 'Granica poena:',
+        'Rebounds': 'Granica skokova:',
+        'Assists': 'Granica asistencija:'
+    }
+    threshold_columns = st.columns(3)
+    for column, (stat_column, label) in zip(threshold_columns, threshold_labels.items()):
+        with column:
+            if not pdf.empty:
+                stat_max = max(float(pdf[stat_column].max()) + 0.5, 1.5)
+                category_thresholds[stat_column] = st.slider(
+                    label,
+                    0.5,
+                    stat_max,
+                    min(10.5, stat_max),
+                    1.0,
+                    key=f"sb_threshold_{stat_column.lower()}"
+                )
+            else:
+                category_thresholds[stat_column] = 10.5
 
     # --- PRIKAZ PODATAKA ---
     if not pdf.empty:
@@ -159,35 +244,97 @@ def main():
             </div>
             <div style="border-left: 1px solid #333; height: 40px;"></div>
             <div style="text-align: center;"><div style="font-size: 12px; color: #888;">PTS</div><div style="font-size: 20px; font-weight: bold;">{pdf['Points'].mean():.1f}</div></div>
-            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">AST</div><div style="font-size: 20px; font-weight: bold;">{pdf['Assistances'].mean():.1f}</div></div>
-            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">REB</div><div style="font-size: 20px; font-weight: bold;">{pdf['TotalRebounds'].mean():.1f}</div></div>
-            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">3PM</div><div style="font-size: 20px; font-weight: bold;">{pdf['FieldGoalsMade3'].mean():.1f}</div></div>
-            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">MINS</div><div style="font-size: 20px; font-weight: bold;">{pdf['MIN_NUMERIC'].mean():.1f}</div></div>
-            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">FGA</div><div style="font-size: 20px; font-weight: bold;">{pdf['FGA'].mean():.1f}</div></div>
+            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">AST</div><div style="font-size: 20px; font-weight: bold;">{pdf['Assists'].mean():.1f}</div></div>
+            <div style="text-align: center;"><div style="font-size: 12px; color: #888;">REB</div><div style="font-size: 20px; font-weight: bold;">{pdf['Rebounds'].mean():.1f}</div></div>
         </div>
         """, unsafe_allow_html=True)
 
         # --- INTERAKTIVNI GRAFIKON ---
         st.write("")
-        chart_df = pdf.sort_values('date').copy()
-        chart_df['date_fmt'] = chart_df['date'].dt.strftime('%d-%b-%Y')
-        chart_df['x_axis'] = chart_df['date_fmt'] + "<br>vs " + chart_df['Opponent'].str[:10]
+        chart_df = pdf.sort_values('Date').copy()
+        chart_df['date_fmt'] = chart_df['Date'].dt.strftime('%d-%b-%Y')
+        chart_df['x_axis'] = chart_df['date_fmt'] + "<br>" + chart_df['MatchupAxis']
         chart_df['Diff'] = chart_df[selected_col] - threshold
+        chart_df['Result'] = chart_df['Diff'].apply(
+            lambda difference: 'Preko granice' if difference > 0 else 'Ispod granice'
+        )
 
         fig = px.bar(
-            chart_df, x='x_axis', y=selected_col, color='Diff', 
-            color_continuous_scale='RdYlGn', color_continuous_midpoint=0, 
-            text_auto=True, title=f"Analiza: {selected_player} | Granica: {threshold}"
+            chart_df, x='x_axis', y=selected_col, color='Result',
+            color_discrete_map={
+                'Preko granice': '#22c55e',
+                'Ispod granice': '#ef4444'
+            },
+            text=selected_col, title=f"Analiza: {selected_player} | Granica: {threshold}"
         )
         fig.add_hline(y=threshold, line_dash="dash", line_color="white")
-        fig.update_layout(xaxis_title="", yaxis_title=selected_label, xaxis_type='category', coloraxis_showscale=False)
+        
+        # Povećanje fonta labela na stubićima
+        fig.update_traces(
+            texttemplate='%{text}',
+            textfont_size=20, 
+            textposition="outside", 
+            cliponaxis=False
+        )
+        fig.add_hline(y=threshold, line_dash="dash", line_color="white")
+        
+        # Povećanje fonta labela na stubićima
+        fig.update_traces(
+            textfont_size=18, 
+            textposition="outside", 
+            cliponaxis=False
+        )
+        
+        # Povećanje fonta osa i naslova
+        fig.update_layout(
+            xaxis_title="", 
+            yaxis_title=selected_label, 
+            xaxis_type='category', 
+            showlegend=False,
+            font=dict(size=16), 
+            title_font_size=22,
+            xaxis=dict(tickfont=dict(size=14)),
+            yaxis=dict(tickfont=dict(size=14))
+        )
         st.plotly_chart(fig, use_container_width=True)
         
         # --- TABELA ---
         st.subheader("Match Log")
-        display_df = pdf[['date', 'Opponent', 'Venue', 'Minutes', 'Points', 'TotalRebounds', 'Assistances', 'FGA', 'Valuation']].copy()
-        display_df['date'] = display_df['date'].dt.strftime('%d-%b-%Y')
-        st.dataframe(display_df, use_container_width=True)
+        display_df = pdf[['Date', 'Matchup', 'Venue', 'Minutes_Numeric', 'Points', 'Rebounds', 'Assists']].copy()
+        stat_columns = ['Points', 'Rebounds', 'Assists']
+
+        def color_stats(row):
+            return [
+                (
+                    "color: #22c55e;"
+                    if row[stat_column] > category_thresholds[stat_column]
+                    else "color: #ef4444;"
+                )
+                for stat_column in stat_columns
+            ]
+
+        styled_display_df = display_df.style.apply(
+            color_stats,
+            axis=1,
+            subset=stat_columns
+        )
+        
+        st.dataframe(
+            styled_display_df, 
+            use_container_width=True,
+            column_config={
+                "Date": st.column_config.DateColumn(
+                    "Datum",
+                    format="DD-MMM-YYYY",
+                ),
+                "Matchup": st.column_config.TextColumn("Utakmica"),
+                "Venue": st.column_config.TextColumn("Lokacija"),
+                "Minutes_Numeric": st.column_config.NumberColumn("Minuti", format="%.1f"),
+                "Points": st.column_config.NumberColumn("Poeni"),
+                "Rebounds": st.column_config.NumberColumn("Skokovi"),
+                "Assists": st.column_config.NumberColumn("Asistencije")
+            }
+        )
     else:
         st.error("Nema utakmica koje zadovoljavaju kombinaciju svih filtera. Klikni 'Resetuj sve filtere'.")
 
