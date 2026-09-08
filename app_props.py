@@ -9,6 +9,13 @@ st.set_page_config(page_title="Euroleague Props", page_icon="🏀", layout="wide
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+    html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]):not([data-testid="stIconMaterial"] *) {
+        font-family: 'Inter', 'Source Sans', sans-serif !important;
+        font-variant-numeric: tabular-nums;
+    }
+
     .stApp { background-color: #0b0e14; }
     div[data-testid="stSidebar"] { background-color: #10141d; }
     .block-container { padding-top: 4rem; }
@@ -37,6 +44,26 @@ st.markdown("""
         display: inline-block; padding: 4px 14px; border-radius: 999px;
         background: #1b2131; color: #9aa4bc; font-size: 13px; font-weight: 600;
         border: 1px solid #2a3245; margin-right: 6px;
+    }
+
+    .sidebar-header {
+        font-size: 12px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase;
+        color: #8b93a7; margin: 2px 0 12px 0; padding-left: 10px;
+        border-left: 3px solid #ff4b4b;
+    }
+
+    .matchup-row-logo {
+        width: 28px; height: 28px; object-fit: contain;
+        background: #1b2131; border-radius: 6px; padding: 3px;
+        display: block; margin: 4px auto;
+        pointer-events: none; /* a raw <img>, not st.image -- no native click-to-zoom */
+    }
+
+    /* Inter renders noticeably wider than Source Sans at the same size, which was
+       wrapping the narrow 3-letter team-code buttons onto two lines ("DU"/"B").
+       Tighter padding/size in the sidebar (where those live) keeps them on one line. */
+    section[data-testid="stSidebar"] .stButton button {
+        font-size: 13px; padding: 4px 6px; white-space: nowrap;
     }
 
     .splits-grid {
@@ -113,9 +140,9 @@ def load_data():
     meta['_key_player'] = meta['Player'].str.strip().str.upper()
     meta['_key_team'] = meta['TeamCode'].str.strip().str.upper()
 
-    meta_cols = ['_key_date', '_key_player', '_key_team', 'Player', 'TeamName',
+    meta_cols = ['_key_date', '_key_player', '_key_team', 'Player', 'TeamCode', 'TeamName',
                  'TeamImageUrl', 'OpponentTeamName', 'OpponentTeamImageUrl',
-                 'Matchup', 'MatchupAxis']
+                 'Matchup', 'MatchupAxis', 'TeamScore', 'OpponentScore']
 
     df = stats.merge(meta[meta_cols], on=['_key_date', '_key_player', '_key_team'],
                       how='inner', suffixes=('', '_meta'))
@@ -155,14 +182,50 @@ def load_data():
         axis=1
     )
 
-    keep = ['Date', 'Player', 'TeamName', 'TeamImageUrl', 'PlayerImageUrl', 'OpponentTeamName',
+    df['TeamScore'] = pd.to_numeric(df['TeamScore'], errors='coerce')
+    df['OpponentScore'] = pd.to_numeric(df['OpponentScore'], errors='coerce')
+    df['GameScore'] = df['TeamScore'].astype('Int64').astype(str) + '-' + df['OpponentScore'].astype('Int64').astype(str)
+    df.loc[df['TeamScore'].isna() | df['OpponentScore'].isna(), 'GameScore'] = None
+    df['ScoreMargin'] = df['TeamScore'] - df['OpponentScore']  # positive = player's team won, negative = lost
+
+    keep = ['Date', 'Player', 'TeamCode', 'TeamName', 'TeamImageUrl', 'PlayerImageUrl', 'OpponentTeamName',
             'OpponentTeamImageUrl', 'Matchup', 'MatchupAxis', 'Venue',
+            'GameScore', 'ScoreMargin',
             'Minutes_Numeric', 'Played',
             'Points', 'Rebounds', 'Assists', 'ThreePM', 'ThreePA',
             'TwoPM', 'TwoPA', 'FTM', 'FTA', 'OffRebounds', 'DefRebounds',
             'Steals', 'Blocks', 'BlocksAgainst', 'Turnovers', 'FoulsCommited',
             'Valuation', 'Plusminus', 'PRA', 'PR', 'PA', 'RA', 'Stocks']
     return df[keep].sort_values('Date', ascending=False).reset_index(drop=True)
+
+
+@st.cache_data
+def load_upcoming_schedule():
+    try:
+        schedule = pd.read_csv('schedule_upcoming.csv')
+    except FileNotFoundError:
+        return None
+    schedule['Date'] = pd.to_datetime(schedule['Date'], errors='coerce')
+    schedule['HomeCode'] = schedule['HomeCode'].str.strip().str.upper()
+    schedule['AwayCode'] = schedule['AwayCode'].str.strip().str.upper()
+    if 'StartTime' in schedule.columns:
+        schedule['StartTime'] = schedule['StartTime'].astype(str).str.strip()
+    else:
+        schedule['StartTime'] = ''
+    return schedule
+
+
+def get_next_game_day(schedule):
+    """The nearest date (today or later) with at least one scheduled game, plus its matchups."""
+    if schedule is None or schedule.empty:
+        return None, None
+    today = pd.Timestamp.now().normalize()
+    upcoming = schedule[schedule['Date'] >= today]
+    if upcoming.empty:
+        return None, None
+    next_date = upcoming['Date'].min()
+    games = upcoming[upcoming['Date'] == next_date].sort_values('StartTime')
+    return next_date, games
 
 
 def snap_line_to_half():
@@ -202,6 +265,33 @@ def hit_rate_color(pct):
 def reset_filters():
     for key in list(st.session_state.keys()):
         del st.session_state[key]
+
+
+def set_session_value(key, value):
+    st.session_state[key] = value
+
+
+def select_matchup(gid):
+    """Pick a whole matchup (both teams) -- clears any single-team narrowing."""
+    st.session_state["sb_next_matchup"] = gid
+    st.session_state.pop("sb_next_team_only", None)
+    st.session_state.pop("sb_next_team_only_for", None)
+
+
+def select_matchup_team(gid, team_code):
+    """Narrow to just one team within a matchup."""
+    st.session_state["sb_next_matchup"] = gid
+    st.session_state["sb_next_team_only"] = team_code
+    st.session_state["sb_next_team_only_for"] = gid
+
+
+def clear_team_only_filter():
+    st.session_state.pop("sb_next_team_only", None)
+    st.session_state.pop("sb_next_team_only_for", None)
+
+
+def sidebar_header(text):
+    st.sidebar.markdown(f'<div class="sidebar-header">{text}</div>', unsafe_allow_html=True)
 
 
 def split_card_html(label, hits, total):
@@ -245,26 +335,172 @@ def main():
         st.error("No data available.")
         return
 
-    st.sidebar.button("🔄 Reset all filters", on_click=reset_filters, use_container_width=True)
+    st.sidebar.button("Reset all filters", on_click=reset_filters, use_container_width=True)
+
+    # --- PLAYER POOL (all players, or only those playing on the next game day) ---
+    schedule_upcoming = load_upcoming_schedule()
+    next_game_date, next_day_games = get_next_game_day(schedule_upcoming)
+    active_team_codes = set()
+    pool_choice = "all"
+
+    team_logo_by_code = (
+        df.dropna(subset=['TeamCode', 'TeamImageUrl'])
+        .drop_duplicates(subset='TeamCode')
+        .set_index('TeamCode')['TeamImageUrl'].to_dict()
+    )
+
+    if next_game_date is not None:
+        active_team_codes = set(next_day_games['HomeCode']) | set(next_day_games['AwayCode'])
+        st.sidebar.markdown("---")
+        sidebar_header("Player pool")
+        # stable option values ("all"/"next") with a display-only label -- the label
+        # text embeds a date that shifts day to day, but the stored choice must not,
+        # or a stale session_state value would no longer match the options list.
+        # "next" listed first so it's the default (radio defaults to its first option).
+        pool_choice = st.sidebar.radio(
+            "Show players from:", ["next", "all"],
+            format_func=lambda v: "All players" if v == "all" else f"Next game day ({next_game_date:%d-%b-%Y})",
+            key="sb_pool_choice",
+        )
+        if pool_choice == "next":
+            # stable id per game ("HOME_AWAY" codes) -- next_day_games is already
+            # sorted by StartTime (earliest tip-off first).
+            game_by_id = {
+                f"{r['HomeCode']}_{r['AwayCode']}": r for _, r in next_day_games.iterrows()
+            }
+            matchup_label_by_id = {
+                gid: f"{row['StartTime']} · {row['HomeCode']} vs {row['AwayCode']}"
+                for gid, row in game_by_id.items()
+            }
+            matchup_choices = ["all"] + list(game_by_id)
+
+            st.sidebar.markdown("---")
+            sidebar_header("Upcoming matchups")
+
+            # dropdown and clickable rows below both drive this same session_state key,
+            # so picking a game either way stays in sync everywhere else on the page.
+            if st.session_state.get("sb_next_matchup") not in matchup_choices:
+                st.session_state["sb_next_matchup"] = "all"
+            selected_matchup_id = st.sidebar.selectbox(
+                "Matchup:", matchup_choices,
+                format_func=lambda gid: "All matchups" if gid == "all" else matchup_label_by_id[gid],
+                key="sb_next_matchup",
+                on_change=clear_team_only_filter,
+            )
+
+            # a team-only narrowing only applies while it's still for the currently
+            # selected matchup -- switching matchups (dropdown or button) clears it,
+            # so a stale pick from a previous game can't silently carry over.
+            team_only_code = st.session_state.get("sb_next_team_only")
+            team_only_for = st.session_state.get("sb_next_team_only_for")
+
+            if selected_matchup_id != "all":
+                game_row = game_by_id[selected_matchup_id]
+                home_code, away_code = game_row['HomeCode'], game_row['AwayCode']
+                if team_only_for == selected_matchup_id and team_only_code in (home_code, away_code):
+                    active_team_codes = {team_only_code}
+                else:
+                    active_team_codes = {home_code, away_code}
+
+            for gid, row in game_by_id.items():
+                is_matchup_selected = gid == selected_matchup_id
+                is_home_only = is_matchup_selected and team_only_for == gid and team_only_code == row['HomeCode']
+                is_away_only = is_matchup_selected and team_only_for == gid and team_only_code == row['AwayCode']
+
+                # logos in their own row, buttons in a second row directly below --
+                # keeps all three buttons on one aligned line instead of the side
+                # buttons sitting lower than the middle one because of the stacked logo.
+                logo_cols = st.sidebar.columns([1, 4, 1])
+                with logo_cols[0]:
+                    st.markdown(
+                        f'<img src="{team_logo_by_code.get(row["HomeCode"], "")}" class="matchup-row-logo" />',
+                        unsafe_allow_html=True,
+                    )
+                with logo_cols[2]:
+                    st.markdown(
+                        f'<img src="{team_logo_by_code.get(row["AwayCode"], "")}" class="matchup-row-logo" />',
+                        unsafe_allow_html=True,
+                    )
+
+                button_cols = st.sidebar.columns([1, 4, 1])
+                with button_cols[0]:
+                    st.button(
+                        row['HomeCode'], key=f"exp_team_home_{gid}", use_container_width=True,
+                        type="primary" if is_home_only else "secondary",
+                        on_click=select_matchup_team, args=(gid, row['HomeCode']),
+                    )
+                with button_cols[1]:
+                    st.button(
+                        f"{row['HomeCode']} vs {row['AwayCode']} · {row['StartTime']}",
+                        key=f"exp_matchup_{gid}", use_container_width=True,
+                        type="primary" if (is_matchup_selected and not is_home_only and not is_away_only) else "secondary",
+                        on_click=select_matchup, args=(gid,),
+                    )
+                with button_cols[2]:
+                    st.button(
+                        row['AwayCode'], key=f"exp_team_away_{gid}", use_container_width=True,
+                        type="primary" if is_away_only else "secondary",
+                        on_click=select_matchup_team, args=(gid, row['AwayCode']),
+                    )
+
     st.sidebar.markdown("---")
-    st.sidebar.header("🏀 Player")
+    sidebar_header("Player")
 
     player_options = (
-        df.dropna(subset=['Player', 'TeamName'])
-        .drop_duplicates(subset=['Player'], keep='first')[['Player', 'TeamName']]
+        df.dropna(subset=['Player', 'TeamName', 'TeamCode'])
+        .drop_duplicates(subset=['Player'], keep='first')[['Player', 'TeamName', 'TeamCode']]
     )
+    if pool_choice == "next":
+        player_options = player_options[player_options['TeamCode'].str.upper().isin(active_team_codes)]
+
     player_map = {
         f"{row['Player']} ({row['TeamName']})": (row['Player'], row['TeamName'])
         for _, row in player_options.sort_values('Player').iterrows()
     }
+
+    if not player_map:
+        st.sidebar.warning("No players found for this pool.")
+        return
+
+    # if the stored pick isn't valid for the current pool (e.g. switching from "All
+    # players" to "Next game day"), reset it before the widget is instantiated --
+    # Streamlit forbids doing this after the widget already exists this run.
+    # NOTE: explicitly assign a valid option here rather than popping the key --
+    # popping leaves Streamlit to default to index 0 internally, but the selectbox's
+    # displayed label can then desync from that (shows the stale pick while the rest
+    # of the page already reflects the new default) until some later, unrelated
+    # rerun catches it up. Setting a real value keeps the widget's own state in sync.
+    if st.session_state.get("sb_player") not in player_map:
+        st.session_state["sb_player"] = next(iter(player_map))
+
     selected_option = st.sidebar.selectbox("Select player:", list(player_map), key="sb_player")
     selected_player, player_team = player_map[selected_option]
+
+    # Scrollable, clickable player list as an alternative to the dropdown above.
+    # Clicking a row writes into the *same* sb_player session_state the dropdown
+    # uses (via on_click), so it's the identical, already-tested selection logic.
+    with st.sidebar.container(height=320):
+        for _, row in player_options.sort_values('Player').iterrows():
+            option_key = f"{row['Player']} ({row['TeamName']})"
+            is_selected = option_key == selected_option
+            cols = st.columns([1, 4])
+            with cols[0]:
+                st.markdown(
+                    f'<img src="{team_logo_by_code.get(row["TeamCode"], "")}" class="matchup-row-logo" />',
+                    unsafe_allow_html=True,
+                )
+            with cols[1]:
+                st.button(
+                    row['Player'], key=f"exp_player_{option_key}", use_container_width=True,
+                    type="primary" if is_selected else "secondary",
+                    on_click=set_session_value, args=("sb_player", option_key),
+                )
 
     pdf = df[(df['Player'] == selected_player) & (df['TeamName'] == player_team)].copy()
     pdf = pdf.sort_values('Date', ascending=False)
 
     st.sidebar.markdown("---")
-    st.sidebar.header("🛠️ Filters")
+    sidebar_header("Filters")
 
     only_played = st.sidebar.checkbox("Exclude DNP / did-not-play games", value=True, key="sb_played")
     if only_played:
@@ -294,6 +530,44 @@ def main():
             sel_min = st.sidebar.slider("Minutes played:", mn, mx, (mn, mx), key="sb_minutes")
             pdf = pdf[pdf['Minutes_Numeric'].between(*sel_min)]
 
+    sel_margin = None
+    margins = pdf['ScoreMargin'].dropna()
+    if not margins.empty:
+        margin_min, margin_max = int(margins.min()), int(margins.max())
+        if margin_min < margin_max:
+            sel_margin = st.sidebar.slider(
+                "Final score margin (pts):", margin_min, margin_max, (margin_min, margin_max),
+                key="sb_margin",
+                help="Positive = player's team won by this many points, negative = lost by this many. "
+                     "Narrow to blowout wins/losses or close games."
+            )
+            pdf = pdf[pdf['ScoreMargin'].isna() | pdf['ScoreMargin'].between(*sel_margin)]
+
+            # Paint the slider track red -> grey -> green, anchored at the true zero
+            # point (loss vs. win) rather than the middle of the range, which is
+            # off-center whenever the min/max margins aren't symmetric. Scoped by
+            # aria-label (mirrors the widget's own label) and DOM structure rather
+            # than Streamlit's internal hashed class names, so it survives version
+            # bumps that would otherwise silently break a class-name-based selector.
+            span = margin_max - margin_min
+            zero_pct = 50.0 if span <= 0 else max(0.0, min(100.0, (0 - margin_min) / span * 100))
+            band = 8.0
+            lo = max(zero_pct - band, 0.0)
+            hi = min(zero_pct + band, 100.0)
+            st.sidebar.markdown(f"""
+            <style>
+                /* the outer track div is a tall (~40px) hit-area, not the visible rail --
+                   painting it directly turned the whole hit-area into a thick color bar.
+                   The actual thin rail is its first child; that's the one to color. */
+                div[role="group"][aria-label="Final score margin (pts):"] > div > div:first-child {{
+                    background: linear-gradient(to right,
+                        #ef4444 0%, #ef4444 {lo}%,
+                        #6b7386 {zero_pct}%,
+                        #22c55e {hi}%, #22c55e 100%) !important;
+                }}
+            </style>
+            """, unsafe_allow_html=True)
+
     pdf_opp = pdf.copy()
     pdf_opp['Opponent'] = pdf_opp.apply(lambda r: get_opponent(r['Matchup'], r['TeamName']), axis=1)
     all_opponents = sorted([o for o in pdf_opp['Opponent'].dropna().unique() if o])
@@ -307,7 +581,7 @@ def main():
     filter_signature = (
         selected_player, player_team, only_played,
         tuple(sorted(include_teammates)), tuple(sorted(exclude_teammates)),
-        venue_choice, sel_min, tuple(sorted(selected_opponents)),
+        venue_choice, sel_min, sel_margin, tuple(sorted(selected_opponents)),
     )
     if st.session_state.get("_filter_signature") != filter_signature:
         st.session_state["_filter_signature"] = filter_signature
@@ -341,9 +615,19 @@ def main():
         stat_col = MARKETS[market_label]
     with col_line:
         cur_max = float(pdf[stat_col].max()) if not pdf.empty else 10.0
+        line_max = max(cur_max + 5, 5.5)
         default_line = min(10.5, max(cur_max / 2, 0.5))
         default_line = int(default_line) + 0.5  # lines always sit on a .5, e.g. 8.5 not 8.0 or 9.0
-        line = st.number_input("Line:", min_value=0.5, max_value=max(cur_max + 5, 5.5),
+
+        # line_max shrinks/grows with the selected player+market's own stat ceiling, but
+        # the line value persists in session_state across player/market switches -- if a
+        # previous player's line no longer fits this one's bounds, reset it before the
+        # widget is instantiated (mutating session_state after is not allowed).
+        stored_line = st.session_state.get("sb_line_val")
+        if stored_line is not None and not (0.5 <= stored_line <= line_max):
+            st.session_state["sb_line_val"] = default_line
+
+        line = st.number_input("Line:", min_value=0.5, max_value=line_max,
                                 value=float(st.session_state.get("sb_line_val", default_line)),
                                 step=0.5, key="sb_line_val", on_change=snap_line_to_half)
     with col_n:
@@ -411,14 +695,15 @@ def main():
     fig.update_traces(texttemplate='%{text}', textfont_size=16, textposition="outside", cliponaxis=False)
     fig.update_layout(
         xaxis_title="", yaxis_title=market_label, xaxis_type='category', showlegend=False,
-        plot_bgcolor='#0b0e14', paper_bgcolor='#0b0e14', font=dict(size=14, color='#cdd3e0'),
+        plot_bgcolor='#0b0e14', paper_bgcolor='#0b0e14',
+        font=dict(family='Inter, sans-serif', size=14, color='#cdd3e0'),
         title_font_size=20, xaxis=dict(tickfont=dict(size=12)), yaxis=dict(tickfont=dict(size=12)),
     )
     st.plotly_chart(fig, use_container_width=True)
 
     # --- MATCH LOG TABLE ---
     st.subheader("Match Log")
-    display_cols = ['Date', 'Matchup', 'Venue', 'Minutes_Numeric', 'Points', 'Rebounds',
+    display_cols = ['Date', 'MatchupAxis', 'GameScore', 'Minutes_Numeric', 'Points', 'Rebounds',
                      'Assists', 'ThreePM', 'Steals', 'Blocks', 'Turnovers', 'PRA']
     display_df = sample[display_cols].copy()
 
@@ -433,8 +718,8 @@ def main():
         styled, use_container_width=True, hide_index=True,
         column_config={
             "Date": st.column_config.DateColumn("Date", format="DD-MMM-YYYY"),
-            "Matchup": st.column_config.TextColumn("Matchup"),
-            "Venue": st.column_config.TextColumn("Venue"),
+            "MatchupAxis": st.column_config.TextColumn("Matchup"),
+            "GameScore": st.column_config.TextColumn("Score"),
             "Minutes_Numeric": st.column_config.NumberColumn("MIN", format="%.1f"),
             "Points": st.column_config.NumberColumn("PTS"),
             "Rebounds": st.column_config.NumberColumn("REB"),
