@@ -129,6 +129,21 @@ def load_data():
     except FileNotFoundError:
         headshots = pd.DataFrame(columns=['_key_player', 'PlayerImageUrl'])
 
+    # dtype=str matters: player codes are zero-padded ("008855"), and pandas would
+    # otherwise read them as ints and break the join against Player_ID.
+    try:
+        rosters = pd.read_csv('rosters.csv', dtype=str)
+        rosters['PlayerCode'] = rosters['PlayerCode'].astype(str).str.strip()
+        rosters = (
+            rosters.dropna(subset=['PlayerCode'])
+            .drop_duplicates(subset='PlayerCode')
+            .set_index('PlayerCode')[['TeamCode', 'TeamName', 'TeamImageUrl']]
+            .rename(columns={'TeamCode': 'RosterTeamCode', 'TeamName': 'RosterTeamName',
+                             'TeamImageUrl': 'RosterTeamImageUrl'})
+        )
+    except FileNotFoundError:
+        rosters = pd.DataFrame(columns=['RosterTeamCode', 'RosterTeamName', 'RosterTeamImageUrl'])
+
     stats = stats[~stats['Player'].str.strip().str.upper().isin(['TOTAL', 'TEAM'])].copy()
 
     # Build a common merge key: date + player name + team code (case/whitespace-insensitive)
@@ -148,6 +163,10 @@ def load_data():
                       how='inner', suffixes=('', '_meta'))
     df = df.merge(headshots, on='_key_player', how='left')
 
+    # Player_ID is the roster feed's player code with a "P" prefix -- stripping it
+    # gives the stable identity used to join rosters/headshots, which beats matching
+    # on name (two different Davids, Kraemer vs Kramer, already collide in this data).
+    df['PlayerCode'] = df['Player_ID'].astype(str).str.strip().str.lstrip('P')
     df['Player'] = df['Player_meta'].fillna(df['Player'])
     df['Date'] = pd.to_datetime(df['_key_date'], errors='coerce')
     df['Minutes_Numeric'] = df['Minutes'].apply(parse_minutes)
@@ -170,6 +189,11 @@ def load_data():
     for c in ['Points', 'Rebounds', 'Assists', 'ThreePM', 'Steals', 'Blocks', 'Turnovers']:
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
+    # the feed's "Valuation" is the EuroLeague's Performance Index Rating -- verified
+    # against the official formula (PTS+REB+AST+STL+BLK+FoulsDrawn, minus missed FG/FT,
+    # turnovers, shots rejected and fouls committed) on every row in the dataset
+    df['PIR'] = pd.to_numeric(df['Valuation'], errors='coerce')
+
     df['PRA'] = df['Points'] + df['Rebounds'] + df['Assists']
     df['PR'] = df['Points'] + df['Rebounds']
     df['PA'] = df['Points'] + df['Assists']
@@ -188,14 +212,44 @@ def load_data():
     df.loc[df['TeamScore'].isna() | df['OpponentScore'].isna(), 'GameScore'] = None
     df['ScoreMargin'] = df['TeamScore'] - df['OpponentScore']  # positive = player's team won, negative = lost
 
-    keep = ['Date', 'Player', 'TeamCode', 'TeamName', 'TeamImageUrl', 'PlayerImageUrl', 'OpponentTeamName',
+    # --- CURRENT TEAM -------------------------------------------------------
+    # A player belongs to whichever club has him on the upcoming season's roster;
+    # if he isn't listed yet (preseason rosters fill in gradually, and some players
+    # simply aren't re-signed), fall back to the team he last played a game for, so
+    # nobody drops out of the app. Roster wins where both exist.
+    last_played = (
+        df.sort_values('Date')
+        .groupby('PlayerCode')
+        .agg(FallbackTeamCode=('TeamCode', 'last'),
+             FallbackTeamName=('TeamName', 'last'),
+             FallbackTeamImageUrl=('TeamImageUrl', 'last'))
+    )
+    current = last_played.join(rosters, how='left')
+    current['CurrentTeamCode'] = current['RosterTeamCode'].fillna(current['FallbackTeamCode'])
+    current['CurrentTeamName'] = current['RosterTeamName'].fillna(current['FallbackTeamName'])
+    current['CurrentTeamImageUrl'] = current['RosterTeamImageUrl'].fillna(current['FallbackTeamImageUrl'])
+    current['IsRostered'] = current['RosterTeamCode'].notna()
+
+    df = df.merge(
+        current[['CurrentTeamCode', 'CurrentTeamName', 'CurrentTeamImageUrl', 'IsRostered']],
+        left_on='PlayerCode', right_index=True, how='left',
+    )
+    # a game played for anyone other than his current club -- surfaced in the match log
+    df['FormerTeamGame'] = (
+        df['TeamCode'].str.upper() != df['CurrentTeamCode'].astype(str).str.upper()
+    )
+
+    keep = ['Date', 'Player', 'PlayerCode', 'TeamCode', 'TeamName', 'TeamImageUrl',
+            'CurrentTeamCode', 'CurrentTeamName', 'CurrentTeamImageUrl',
+            'IsRostered', 'FormerTeamGame',
+            'PlayerImageUrl', 'OpponentTeamName',
             'OpponentTeamImageUrl', 'Matchup', 'MatchupAxis', 'Venue',
             'GameScore', 'ScoreMargin',
             'Minutes_Numeric', 'Played',
             'Points', 'Rebounds', 'Assists', 'ThreePM', 'ThreePA',
             'TwoPM', 'TwoPA', 'FTM', 'FTA', 'OffRebounds', 'DefRebounds',
             'Steals', 'Blocks', 'BlocksAgainst', 'Turnovers', 'FoulsCommited',
-            'Valuation', 'Plusminus', 'PRA', 'PR', 'PA', 'RA', 'Stocks']
+            'PIR', 'Plusminus', 'PRA', 'PR', 'PA', 'RA', 'Stocks']
     return df[keep].sort_values('Date', ascending=False).reset_index(drop=True)
 
 
@@ -323,6 +377,7 @@ MARKETS = {
     'Pts + Ast (PA)': 'PA',
     'Reb + Ast (RA)': 'RA',
     'Stocks (Stl + Blk)': 'Stocks',
+    'PIR (Valuation)': 'PIR',
 }
 
 
@@ -343,10 +398,17 @@ def main():
     active_team_codes = set()
     pool_choice = "all"
 
+    # historical crests, then roster crests layered on top -- clubs new to the
+    # competition (Besiktas in 2026-27) have no game history to source a logo from
     team_logo_by_code = (
         df.dropna(subset=['TeamCode', 'TeamImageUrl'])
         .drop_duplicates(subset='TeamCode')
         .set_index('TeamCode')['TeamImageUrl'].to_dict()
+    )
+    team_logo_by_code.update(
+        df.dropna(subset=['CurrentTeamCode', 'CurrentTeamImageUrl'])
+        .drop_duplicates(subset='CurrentTeamCode')
+        .set_index('CurrentTeamCode')['CurrentTeamImageUrl'].to_dict()
     )
 
     if next_game_date is not None:
@@ -446,15 +508,20 @@ def main():
     st.sidebar.markdown("---")
     sidebar_header("Player")
 
+    # keyed on the player code, not the name: a player is one entry under his current
+    # club even if his games were played for a different one (traded in the offseason).
     player_options = (
-        df.dropna(subset=['Player', 'TeamName', 'TeamCode'])
-        .drop_duplicates(subset=['Player'], keep='first')[['Player', 'TeamName', 'TeamCode']]
+        df.dropna(subset=['Player', 'PlayerCode', 'CurrentTeamCode', 'CurrentTeamName'])
+        .drop_duplicates(subset=['PlayerCode'], keep='first')
+        [['PlayerCode', 'Player', 'CurrentTeamCode', 'CurrentTeamName', 'CurrentTeamImageUrl']]
     )
     if pool_choice == "next":
-        player_options = player_options[player_options['TeamCode'].str.upper().isin(active_team_codes)]
+        player_options = player_options[
+            player_options['CurrentTeamCode'].str.upper().isin(active_team_codes)
+        ]
 
     player_map = {
-        f"{row['Player']} ({row['TeamName']})": (row['Player'], row['TeamName'])
+        f"{row['Player']} ({row['CurrentTeamName']})": row['PlayerCode']
         for _, row in player_options.sort_values('Player').iterrows()
     }
 
@@ -474,19 +541,23 @@ def main():
         st.session_state["sb_player"] = next(iter(player_map))
 
     selected_option = st.sidebar.selectbox("Select player:", list(player_map), key="sb_player")
-    selected_player, player_team = player_map[selected_option]
+    selected_code = player_map[selected_option]
+    selected_row = player_options[player_options['PlayerCode'] == selected_code].iloc[0]
+    selected_player = selected_row['Player']
+    player_team = selected_row['CurrentTeamName']
+    player_team_code = selected_row['CurrentTeamCode']
 
     # Scrollable, clickable player list as an alternative to the dropdown above.
     # Clicking a row writes into the *same* sb_player session_state the dropdown
     # uses (via on_click), so it's the identical, already-tested selection logic.
     with st.sidebar.container(height=320):
         for _, row in player_options.sort_values('Player').iterrows():
-            option_key = f"{row['Player']} ({row['TeamName']})"
+            option_key = f"{row['Player']} ({row['CurrentTeamName']})"
             is_selected = option_key == selected_option
             cols = st.columns([1, 4])
             with cols[0]:
                 st.markdown(
-                    f'<img src="{team_logo_by_code.get(row["TeamCode"], "")}" class="matchup-row-logo" />',
+                    f'<img src="{row["CurrentTeamImageUrl"] or ""}" class="matchup-row-logo" />',
                     unsafe_allow_html=True,
                 )
             with cols[1]:
@@ -496,7 +567,9 @@ def main():
                     on_click=set_session_value, args=("sb_player", option_key),
                 )
 
-    pdf = df[(df['Player'] == selected_player) & (df['TeamName'] == player_team)].copy()
+    # all of his games, whichever club they were played for -- a traded player's
+    # old-team form is the only history there is to project the new season from
+    pdf = df[df['PlayerCode'] == selected_code].copy()
     pdf = pdf.sort_values('Date', ascending=False)
 
     st.sidebar.markdown("---")
@@ -506,18 +579,27 @@ def main():
     if only_played:
         pdf = pdf[pdf['Played']]
 
-    teammates = sorted(df[(df['TeamName'] == player_team) & (df['Player'] != selected_player)]['Player'].unique())
+    # Teammates are whoever actually appeared in the same games he did, matched on
+    # (date, team) pairs from his own rows rather than on his current club -- for a
+    # traded player those games belong to his former team, so filtering by the
+    # current club would match nothing.
+    player_game_keys = set(zip(pdf['Date'], pdf['TeamCode']))
+    squad_rows = df[[k in player_game_keys for k in zip(df['Date'], df['TeamCode'])]]
+    teammates = sorted(squad_rows[squad_rows['PlayerCode'] != selected_code]['Player'].unique())
+
+    def games_teammate_played(names):
+        played = squad_rows[squad_rows['Player'].isin(names) & squad_rows['Played']]
+        return set(zip(played['Date'], played['TeamCode']))
 
     include_teammates = st.sidebar.multiselect("Include games teammate played:", teammates, key="sb_teammates_include")
-    if include_teammates:
-        for teammate in include_teammates:
-            teammate_dates = df[(df['TeamName'] == player_team) & (df['Player'] == teammate) & (df['Played'])]['Date'].unique()
-            pdf = pdf[pdf['Date'].isin(teammate_dates)]
+    for teammate in include_teammates:
+        keys = games_teammate_played([teammate])
+        pdf = pdf[[k in keys for k in zip(pdf['Date'], pdf['TeamCode'])]]
 
     exclude_teammates = st.sidebar.multiselect("Exclude games teammate played:", teammates, key="sb_teammates")
     if exclude_teammates:
-        played_with = df[(df['TeamName'] == player_team) & (df['Player'].isin(exclude_teammates)) & (df['Played'])]['Date'].unique()
-        pdf = pdf[~pdf['Date'].isin(played_with)]
+        keys = games_teammate_played(exclude_teammates)
+        pdf = pdf[[k not in keys for k in zip(pdf['Date'], pdf['TeamCode'])]]
 
     venue_choice = st.sidebar.radio("Venue:", ['All', 'Home', 'Away'], key="sb_venue", horizontal=True)
     if venue_choice != 'All':
@@ -588,9 +670,14 @@ def main():
         st.session_state.pop("sb_num_games", None)
 
     # --- HEADER CARD ---
-    logo = pdf['TeamImageUrl'].dropna().iloc[0] if not pdf['TeamImageUrl'].dropna().empty else ""
+    # badge shows his current club, not whoever he last played a game for
+    logo = selected_row['CurrentTeamImageUrl'] or team_logo_by_code.get(player_team_code, "")
     headshot = pdf['PlayerImageUrl'].dropna().iloc[0] if not pdf['PlayerImageUrl'].dropna().empty else logo
     games_count = len(pdf)
+    former_count = int(pdf['FormerTeamGame'].sum()) if not pdf.empty else 0
+    former_note = (
+        f" &nbsp;•&nbsp; {former_count} with a former team" if former_count else ""
+    )
     st.markdown(f"""
     <div class="player-card">
         <div class="player-photo-wrap">
@@ -599,7 +686,7 @@ def main():
         </div>
         <div>
             <div class="player-name">{selected_player}</div>
-            <div class="player-sub">{player_team} &nbsp;•&nbsp; {games_count} games matching filters</div>
+            <div class="player-sub">{player_team} &nbsp;•&nbsp; {games_count} games matching filters{former_note}</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -703,14 +790,26 @@ def main():
 
     # --- MATCH LOG TABLE ---
     st.subheader("Match Log")
-    display_cols = ['Date', 'MatchupAxis', 'GameScore', 'Minutes_Numeric', 'Points', 'Rebounds',
-                     'Assists', 'ThreePM', 'Steals', 'Blocks', 'Turnovers', 'PRA']
+    # which club he played the game for -- starred and dimmed when it isn't his
+    # current one, so old-team form is never mistaken for form with the new club
+    sample = sample.copy()
+    sample['TeamPlayed'] = sample['TeamCode'].astype(str) + sample['FormerTeamGame'].map({True: ' *', False: ''})
+    former_mask = sample['FormerTeamGame']
+
+    display_cols = ['Date', 'TeamPlayed', 'MatchupAxis', 'GameScore', 'Minutes_Numeric', 'Points',
+                     'Rebounds', 'Assists', 'ThreePM', 'Steals', 'Blocks', 'Turnovers', 'PRA', 'PIR']
     display_df = sample[display_cols].copy()
 
     def color_market(row):
-        return ["color: #22c55e; font-weight:700;" if col == stat_col and row[col] > line
-                else ("color: #ef4444; font-weight:700;" if col == stat_col else "")
-                for col in display_cols]
+        is_former = bool(former_mask.loc[row.name])
+        styles = []
+        for col in display_cols:
+            if col == stat_col:
+                styles.append("color: #22c55e; font-weight:700;" if row[col] > line
+                              else "color: #ef4444; font-weight:700;")
+            else:
+                styles.append("color: #6b7386;" if is_former else "")
+        return styles
 
     styled = display_df.style.apply(color_market, axis=1, subset=display_cols)
 
@@ -718,6 +817,7 @@ def main():
         styled, use_container_width=True, hide_index=True,
         column_config={
             "Date": st.column_config.DateColumn("Date", format="DD-MMM-YYYY"),
+            "TeamPlayed": st.column_config.TextColumn("Team"),
             "MatchupAxis": st.column_config.TextColumn("Matchup"),
             "GameScore": st.column_config.TextColumn("Score"),
             "Minutes_Numeric": st.column_config.NumberColumn("MIN", format="%.1f"),
@@ -729,8 +829,11 @@ def main():
             "Blocks": st.column_config.NumberColumn("BLK"),
             "Turnovers": st.column_config.NumberColumn("TOV"),
             "PRA": st.column_config.NumberColumn("PRA"),
+            "PIR": st.column_config.NumberColumn("PIR"),
         }
     )
+    if bool(former_mask.any()):
+        st.caption(f"* played for a former team — {player_team} is his current club.")
 
 
 if __name__ == "__main__":
