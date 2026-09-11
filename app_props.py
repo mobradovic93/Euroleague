@@ -62,8 +62,11 @@ st.markdown("""
     /* Inter renders noticeably wider than Source Sans at the same size, which was
        wrapping the narrow 3-letter team-code buttons onto two lines ("DU"/"B").
        Tighter padding/size in the sidebar (where those live) keeps them on one line. */
+    /* 2px of side padding, not 6: the 3-letter team-code buttons sit in ~40px
+       columns, and a code like "MUN" needs ~34px of text width -- any more padding
+       and the code itself gets clipped. The wide middle button has room to spare. */
     section[data-testid="stSidebar"] .stButton button {
-        font-size: 13px; padding: 4px 6px; white-space: nowrap;
+        font-size: 13px; padding: 4px 2px; white-space: nowrap;
     }
 
     .splits-grid {
@@ -84,6 +87,25 @@ st.markdown("""
     .stat-box .l { font-size: 11px; color: #8b93a7; }
 
     section[data-testid="stSidebar"] label, .stSlider label, .stRadio label { color: #cdd3e0 !important; }
+
+    /* Streamlit stacks st.columns vertically on narrow screens. In the main area
+       that's wanted (the market/line controls get room), but in the sidebar it
+       explodes each compact matchup row -- logo | button | logo -- into three
+       full-width lines, turning 7 matchups into ~35 rows of scrolling. Keep the
+       sidebar's rows horizontal at every width. */
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        gap: 0.3rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stColumn"] {
+        min-width: 0 !important;
+    }
+
+    /* main-area quick pickers: reachable without opening the sidebar on mobile */
+    .quick-pick-label {
+        font-size: 11px; font-weight: 700; letter-spacing: .08em;
+        text-transform: uppercase; color: #6b7386; margin-bottom: 2px;
+    }
 
     /* --- Mobile --- */
     @media (max-width: 640px) {
@@ -411,6 +433,15 @@ def main():
         .set_index('CurrentTeamCode')['CurrentTeamImageUrl'].to_dict()
     )
 
+    # Reserve the top of the main column for the quick pickers before anything else
+    # is written there. Streamlit places main-area elements in call order, and these
+    # get filled in further down once their option lists exist.
+    # Reading the pool choice from session_state rather than the radio's return value
+    # is safe: Streamlit commits widget state before rerunning the script, so this
+    # already reflects the current selection.
+    pool_is_next = next_game_date is not None and st.session_state.get("sb_pool_choice", "next") == "next"
+    quick_pick_cols = st.columns(2) if pool_is_next else [st.container()]
+
     if next_game_date is not None:
         active_team_codes = set(next_day_games['HomeCode']) | set(next_day_games['AwayCode'])
         st.sidebar.markdown("---")
@@ -443,12 +474,18 @@ def main():
             # so picking a game either way stays in sync everywhere else on the page.
             if st.session_state.get("sb_next_matchup") not in matchup_choices:
                 st.session_state["sb_next_matchup"] = "all"
-            selected_matchup_id = st.sidebar.selectbox(
-                "Matchup:", matchup_choices,
-                format_func=lambda gid: "All matchups" if gid == "all" else matchup_label_by_id[gid],
-                key="sb_next_matchup",
-                on_change=clear_team_only_filter,
-            )
+            # rendered in the main area (see quick_pick_cols) rather than the sidebar:
+            # on a phone the sidebar is a modal overlay, so switching game or player
+            # meant opening it, picking, and closing it again for every change.
+            with quick_pick_cols[0]:
+                st.markdown('<div class="quick-pick-label">Matchup</div>', unsafe_allow_html=True)
+                selected_matchup_id = st.selectbox(
+                    "Matchup:", matchup_choices,
+                    format_func=lambda gid: "All matchups" if gid == "all" else matchup_label_by_id[gid],
+                    key="sb_next_matchup",
+                    on_change=clear_team_only_filter,
+                    label_visibility="collapsed",
+                )
 
             # a team-only narrowing only applies while it's still for the currently
             # selected matchup -- switching matchups (dropdown or button) clears it,
@@ -540,7 +577,11 @@ def main():
     if st.session_state.get("sb_player") not in player_map:
         st.session_state["sb_player"] = next(iter(player_map))
 
-    selected_option = st.sidebar.selectbox("Select player:", list(player_map), key="sb_player")
+    with quick_pick_cols[-1]:
+        st.markdown('<div class="quick-pick-label">Player</div>', unsafe_allow_html=True)
+        selected_option = st.selectbox(
+            "Select player:", list(player_map), key="sb_player", label_visibility="collapsed",
+        )
     selected_code = player_map[selected_option]
     selected_row = player_options[player_options['PlayerCode'] == selected_code].iloc[0]
     selected_player = selected_row['Player']
