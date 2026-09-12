@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Euroleague Props", page_icon="🏀", layout="wide")
 
@@ -73,10 +74,23 @@ st.markdown("""
         display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
         gap: 10px; margin-top: 6px;
     }
+    /* bottom padding reserves a strip for the sparkline so it sits *below* the
+       numbers rather than behind them -- bars crossing the digits made them hard
+       to read, especially on the dense 80-game cards */
     .split-card {
         background: #131826; border: 1px solid #232a38; border-radius: 14px;
-        padding: 14px 8px; text-align: center;
+        padding: 14px 8px 34px; text-align: center;
+        position: relative; overflow: hidden;
     }
+    /* absolute height (not a %) so the strip can't grow into the reserved padding
+       on taller cards. Non-interactive: never eats a tap meant for the card. */
+    .split-spark {
+        position: absolute; left: 0; right: 0; bottom: 0;
+        width: 100%; height: 28px; opacity: .55; pointer-events: none;
+    }
+    .split-card > .split-label,
+    .split-card > .split-pct,
+    .split-card > .split-frac { position: relative; z-index: 1; }
     .split-label { font-size: 12px; color: #8b93a7; letter-spacing: .04em; font-weight: 700; }
     .split-pct { font-size: 30px; font-weight: 800; margin: 4px 0 2px 0; }
     .split-frac { font-size: 13px; color: #6b7386; }
@@ -119,6 +133,9 @@ st.markdown("""
         .split-pct { font-size: 22px; }
         .split-label { font-size: 10px; }
         .split-frac { font-size: 11px; }
+        /* shorter strip + matching reserved padding on the smaller mobile cards */
+        .split-card { padding: 12px 6px 24px; }
+        .split-spark { height: 20px; }
         .stat-box .v { font-size: 17px; }
         .market-pill { font-size: 12px; padding: 3px 10px; }
     }
@@ -370,7 +387,36 @@ def sidebar_header(text):
     st.sidebar.markdown(f'<div class="sidebar-header">{text}</div>', unsafe_allow_html=True)
 
 
-def split_card_html(label, hits, total):
+def sparkline_svg(values, line):
+    """Faded per-game bars for the back of a split card: green over the line, red under.
+
+    Bars are drawn from a zero baseline rather than from the bottom of the box, so
+    a market that goes negative (PIR) draws downward instead of being clipped flat.
+    """
+    values = [v for v in values if pd.notna(v)]
+    if not values:
+        return ""
+    lo, hi = min(0, min(values)), max(0, max(values))
+    span = (hi - lo) or 1
+    width = 100 / len(values)
+    zero_y = 30 * (hi - 0) / span
+    bars = []
+    for i, v in enumerate(values):
+        value_y = 30 * (hi - v) / span
+        top, height = min(zero_y, value_y), abs(zero_y - value_y)
+        height = max(height, 0.9)  # keep a zero game visible as a sliver
+        colour = '#22c55e' if v > line else '#ef4444'
+        bars.append(
+            f'<rect x="{i * width + width * 0.12:.2f}" y="{top:.2f}" '
+            f'width="{width * 0.76:.2f}" height="{height:.2f}" fill="{colour}"/>'
+        )
+    return (f'<svg class="split-spark" viewBox="0 0 100 30" preserveAspectRatio="none">'
+            f'{"".join(bars)}</svg>')
+
+
+def split_card_html(label, values, line):
+    total = len(values)
+    hits = sum(1 for v in values if pd.notna(v) and v > line)
     if total == 0:
         pct, color = 0, "#555"
     else:
@@ -380,7 +426,8 @@ def split_card_html(label, hits, total):
     # blank-line-then-4-space-indent as a literal code block, which breaks
     # unsafe_allow_html for every card after the first once these get joined.
     return (
-        f'<div class="split-card"><div class="split-label">{label}</div>'
+        f'<div class="split-card">{sparkline_svg(values, line)}'
+        f'<div class="split-label">{label}</div>'
         f'<div class="split-pct" style="color:{color};">{pct:.0f}%</div>'
         f'<div class="split-frac">{hits}/{total}</div></div>'
     )
@@ -400,6 +447,41 @@ MARKETS = {
     'Reb + Ast (RA)': 'RA',
     'Stocks (Stl + Blk)': 'Stocks',
     'PIR (Valuation)': 'PIR',
+}
+
+# Optional second series drawn over the bars on its own axis, for context the market
+# alone doesn't give: was a big scoring night just heavy minutes, or genuine efficiency?
+# Each entry returns a Series from the games frame.
+CONTEXT_METRICS = {
+    'None': None,
+    'Minutes': lambda d: d['Minutes_Numeric'],
+    'FGA (2P+3P)': lambda d: d['TwoPA'] + d['ThreePA'],
+    'FG%': lambda d: ((d['TwoPM'] + d['ThreePM']) / (d['TwoPA'] + d['ThreePA']).replace(0, pd.NA) * 100),
+    '3P attempts': lambda d: d['ThreePA'],
+    'FT attempts': lambda d: d['FTA'],
+    'PIR': lambda d: d['PIR'],
+    'Plus/minus': lambda d: d['Plusminus'],
+    'Points': lambda d: d['Points'],
+    'Rebounds': lambda d: d['Rebounds'],
+    'Assists': lambda d: d['Assists'],
+}
+
+# short codes for the quick-switch chips above the chart -- the dropdown keeps the
+# descriptive names, these are the abbreviations props are actually quoted in
+MARKET_CHIPS = {
+    'Points': 'PTS',
+    'Rebounds': 'REB',
+    'Assists': 'AST',
+    'Pts + Reb + Ast (PRA)': 'PRA',
+    'Pts + Reb (PR)': 'PR',
+    'Pts + Ast (PA)': 'PA',
+    'Reb + Ast (RA)': 'RA',
+    'PIR (Valuation)': 'PIR',
+    '3-Pointers Made': '3PM',
+    'Steals': 'STL',
+    'Blocks': 'BLK',
+    'Stocks (Stl + Blk)': 'STK',
+    'Turnovers': 'TOV',
 }
 
 
@@ -776,8 +858,9 @@ def main():
         ("HOME", pdf[pdf['Venue'] == 'Home']),
         ("AWAY", pdf[pdf['Venue'] == 'Away']),
     ]
+    # oldest -> newest so the sparkline reads as a trend, matching the chart below
     cards_html = "".join(
-        split_card_html(label, int((subset[stat_col] > line).sum()), len(subset))
+        split_card_html(label, subset.sort_values('Date')[stat_col].tolist(), line)
         for label, subset in split_defs
     )
     st.markdown(f'<div class="splits-grid">{cards_html}</div>', unsafe_allow_html=True)
@@ -806,27 +889,85 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # --- CHART ---
+    # --- MARKET CHIPS ---
+    # One tap to switch market, instead of opening the dropdown -- which matters most
+    # on mobile. horizontal=True gives a real flex row that wraps, so these don't hit
+    # the st.columns problem of stacking one-per-line on a narrow screen.
+    # They write into the dropdown's own session_state key, so both stay in sync.
     st.write("")
+    with st.container(horizontal=True, gap="small", key="market_chips"):
+        for label, chip in MARKET_CHIPS.items():
+            st.button(
+                chip, key=f"chip_{MARKETS[label]}",
+                type="primary" if label == market_label else "secondary",
+                on_click=set_session_value, args=("sb_market", label),
+            )
+
+    context_col, _ = st.columns([1, 2])
+    with context_col:
+        context_label = st.selectbox(
+            "Overlay:", list(CONTEXT_METRICS), key="sb_context",
+            help="Draw a second series over the bars on its own axis — e.g. points "
+                 "against minutes played, or against shots taken.",
+        )
+
+    # --- CHART ---
     chart_df = sample.sort_values('Date').copy()
     chart_df['date_fmt'] = chart_df['Date'].dt.strftime('%d-%b-%Y')
     chart_df['x_axis'] = chart_df['date_fmt'] + "<br>" + chart_df['MatchupAxis']
     chart_df['Result'] = chart_df[stat_col].apply(lambda v: 'Over' if v > line else 'Under')
+    # Hover context: the final score and the signed margin (+ = his team won).
+    # Built as text here rather than formatted in the template so missing scores
+    # show a dash instead of Plotly printing "nan".
+    chart_df['ScoreHover'] = chart_df['GameScore'].fillna('—')
+    chart_df['MarginHover'] = chart_df['ScoreMargin'].apply(
+        lambda m: '—' if pd.isna(m) else f'{m:+.0f}')
 
     fig = px.bar(
         chart_df, x='x_axis', y=stat_col, color='Result',
         color_discrete_map={'Over': '#22c55e', 'Under': '#ef4444'},
         text=stat_col, title=f"{selected_player} — {market_label} (line {line})",
-        category_orders={'x_axis': chart_df['x_axis'].tolist()}
+        category_orders={'x_axis': chart_df['x_axis'].tolist()},
+        custom_data=['ScoreHover', 'MarginHover'],
     )
     fig.add_hline(y=line, line_dash="dash", line_color="white")
-    fig.update_traces(texttemplate='%{text}', textfont_size=16, textposition="outside", cliponaxis=False)
+    # The market value is already printed on top of every bar, so the hover spends
+    # its space on what isn't on screen: the scoreline and the margin.
+    fig.update_traces(
+        texttemplate='%{text}', textfont_size=16, textposition="outside", cliponaxis=False,
+        hovertemplate='%{x}<br>Score: %{customdata[0]}<br>Margin: %{customdata[1]}<extra></extra>',
+    )
     fig.update_layout(
         xaxis_title="", yaxis_title=market_label, xaxis_type='category', showlegend=False,
         plot_bgcolor='#0b0e14', paper_bgcolor='#0b0e14',
         font=dict(family='Inter, sans-serif', size=14, color='#cdd3e0'),
         title_font_size=20, xaxis=dict(tickfont=dict(size=12)), yaxis=dict(tickfont=dict(size=12)),
     )
+
+    # Overlay sits on its own right-hand axis so it isn't squashed by the market's
+    # scale (minutes ~20-30 against 3PM ~0-5 would otherwise flatten one of them).
+    # Kept faint on purpose: it's context for the bars, not a competing series.
+    context_fn = CONTEXT_METRICS.get(context_label)
+    if context_fn is not None:
+        context_values = pd.to_numeric(context_fn(chart_df), errors='coerce')
+        if context_values.notna().any():
+            suffix = '%' if context_label == 'FG%' else ''
+            fig.add_trace(go.Scatter(
+                x=chart_df['x_axis'], y=context_values, yaxis='y2',
+                mode='lines+markers', name=context_label,
+                # linear, not spline: a smoothed curve overshoots between points and
+                # was drawing FG% above 100%, implying values the player never posted
+                line=dict(color='#c3cadb', width=2.2, shape='linear'),
+                marker=dict(size=5, color='#c3cadb'),
+                opacity=0.55, connectgaps=False,
+                hovertemplate=f'{context_label}: %{{y:.1f}}{suffix}<extra></extra>',
+            ))
+            fig.update_layout(yaxis2=dict(
+                overlaying='y', side='right', showgrid=False,
+                title=dict(text=context_label, font=dict(size=12, color='#8b93a7')),
+                tickfont=dict(size=11, color='#8b93a7'),
+                rangemode='tozero', zeroline=False,
+            ))
     st.plotly_chart(fig, use_container_width=True)
 
     # --- MATCH LOG TABLE ---
