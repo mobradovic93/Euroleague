@@ -117,6 +117,12 @@ st.markdown("""
         min-width: 0 !important;
     }
 
+    /* date separator in the matchup list -- a round runs over two or three days */
+    .matchup-date {
+        font-size: 11px; font-weight: 700; letter-spacing: .06em;
+        color: #6b7386; margin: 12px 0 2px 2px; text-transform: uppercase;
+    }
+
     /* main-area quick pickers: reachable without opening the sidebar on mobile */
     .quick-pick-label {
         font-size: 11px; font-weight: 700; letter-spacing: .08em;
@@ -339,6 +345,30 @@ def get_next_game_day(schedule):
     return next_date, games
 
 
+def get_next_round(schedule):
+    """The next round and every game in it.
+
+    The feed calls it GameDay, but it is the round: 1-38, each spread over two or
+    three dates. "Next game day" therefore only ever shows part of a round, which
+    is why this exists alongside it. Returns (round number, games sorted by date
+    then tip-off), or (None, None) once the season is over.
+    """
+    if schedule is None or schedule.empty:
+        return None, None
+    today = pd.Timestamp.now().normalize()
+    upcoming = schedule[schedule['Date'] >= today]
+    if upcoming.empty:
+        return None, None
+
+    # the round of the next game actually being played, rather than the lowest round
+    # number still outstanding -- a postponed fixture from an early round would
+    # otherwise drag the list back to a round that finished weeks ago
+    next_date = upcoming['Date'].min()
+    next_round = upcoming[upcoming['Date'] == next_date]['GameDay'].iloc[0]
+    games = schedule[schedule['GameDay'] == next_round].sort_values(['Date', 'StartTime'])
+    return next_round, games
+
+
 def snap_line_to_half():
     """Keep the line on a .5 grid (8.5, not 8.0 or 9.0) even after direct typing.
     Must run as an on_change callback: Streamlit forbids mutating a widget's own
@@ -518,6 +548,7 @@ def main():
     # --- PLAYER POOL (all players, or only those playing on the next game day) ---
     schedule_upcoming = load_upcoming_schedule(data_signature('schedule_upcoming.csv'))
     next_game_date, next_day_games = get_next_game_day(schedule_upcoming)
+    next_round, next_round_games = get_next_round(schedule_upcoming)
     active_team_codes = set()
     pool_choice = "all"
 
@@ -540,32 +571,59 @@ def main():
     # Reading the pool choice from session_state rather than the radio's return value
     # is safe: Streamlit commits widget state before rerunning the script, so this
     # already reflects the current selection.
-    pool_is_next = next_game_date is not None and st.session_state.get("sb_pool_choice", "next") == "next"
+    pool_is_next = next_game_date is not None and st.session_state.get("sb_pool_choice", "next") in ("next", "round")
     quick_pick_cols = st.columns(2) if pool_is_next else [st.container()]
 
     if next_game_date is not None:
-        active_team_codes = set(next_day_games['HomeCode']) | set(next_day_games['AwayCode'])
         st.sidebar.markdown("---")
         sidebar_header("Player pool")
-        # stable option values ("all"/"next") with a display-only label -- the label
-        # text embeds a date that shifts day to day, but the stored choice must not,
-        # or a stale session_state value would no longer match the options list.
-        # "next" listed first so it's the default (radio defaults to its first option).
+
+        def pool_label(value):
+            if value == "all":
+                return "All players"
+            if value == "round":
+                if next_round_games is None:
+                    return "Next round"
+                dates = next_round_games['Date']
+                span = f"{dates.min():%d.%m}"
+                if dates.nunique() > 1:
+                    span += f"-{dates.max():%d.%m}"
+                return f"Next round ({next_round}) - {span}"
+            return f"Next game day ({next_game_date:%d.%m})"
+
+        # stable option values with display-only labels -- the labels embed dates
+        # that shift from day to day, but the stored choice must not, or a stale
+        # session_state value would no longer match the options list.
+        # "next" stays first so it remains the default.
+        pool_options = ["next", "all"] if next_round_games is None else ["next", "round", "all"]
         pool_choice = st.sidebar.radio(
-            "Show players from:", ["next", "all"],
-            format_func=lambda v: "All players" if v == "all" else f"Next game day ({next_game_date:%d-%b-%Y})",
+            "Show players from:", pool_options,
+            format_func=pool_label,
             key="sb_pool_choice",
         )
-        if pool_choice == "next":
-            # stable id per game ("HOME_AWAY" codes) -- next_day_games is already
-            # sorted by StartTime (earliest tip-off first).
+
+        # a round covers two or three game days, so its pool is the wider one
+        if pool_choice == "round" and next_round_games is not None:
+            pool_games = next_round_games
+        elif pool_choice == "next":
+            pool_games = next_day_games
+        else:
+            pool_games = None
+
+        if pool_games is not None:
+            active_team_codes = set(pool_games['HomeCode']) | set(pool_games['AwayCode'])
+            # stable id per game ("HOME_AWAY" codes) -- pool_games is already
+            # sorted by date then tip-off, so the list reads in playing order.
             game_by_id = {
-                f"{r['HomeCode']}_{r['AwayCode']}": r for _, r in next_day_games.iterrows()
+                f"{r['HomeCode']}_{r['AwayCode']}": r for _, r in pool_games.iterrows()
             }
+            # date next to the tip-off: across a multi-day round the time alone
+            # doesn't say which day a game is on
             matchup_label_by_id = {
-                gid: f"{row['StartTime']} · {row['HomeCode']} vs {row['AwayCode']}"
+                gid: f"{row['Date']:%d.%m} {row['StartTime']} · {row['HomeCode']} vs {row['AwayCode']}"
                 for gid, row in game_by_id.items()
             }
+            spans_days = pool_games['Date'].nunique() > 1
             matchup_choices = ["all"] + list(game_by_id)
 
             st.sidebar.markdown("---")
@@ -602,7 +660,17 @@ def main():
                 else:
                     active_team_codes = {home_code, away_code}
 
+            shown_date = None
             for gid, row in game_by_id.items():
+                # a heading whenever the day changes, so a multi-day round reads as
+                # separate batches rather than one undifferentiated list
+                if spans_days and row['Date'] != shown_date:
+                    st.sidebar.markdown(
+                        f'<div class="matchup-date">{row["Date"]:%a %d.%m}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    shown_date = row['Date']
+
                 is_matchup_selected = gid == selected_matchup_id
                 is_home_only = is_matchup_selected and team_only_for == gid and team_only_code == row['HomeCode']
                 is_away_only = is_matchup_selected and team_only_for == gid and team_only_code == row['AwayCode']
@@ -653,7 +721,9 @@ def main():
         .drop_duplicates(subset=['PlayerCode'], keep='first')
         [['PlayerCode', 'Player', 'CurrentTeamCode', 'CurrentTeamName', 'CurrentTeamImageUrl']]
     )
-    if pool_choice == "next":
+    # narrow whenever a pool is active -- keyed on the team set rather than on a
+    # specific pool_choice value, so adding another pool can't silently skip this
+    if active_team_codes:
         player_options = player_options[
             player_options['CurrentTeamCode'].str.upper().isin(active_team_codes)
         ]
