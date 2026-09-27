@@ -1,3 +1,5 @@
+import os
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -157,8 +159,24 @@ def parse_minutes(x):
         return 0.0
 
 
+# Streamlit keys @st.cache_data on the function's arguments, and these loaders took
+# none -- so a running app kept serving the dataframe it had built at startup even
+# after the CSVs underneath it were rewritten. Passing a signature of the files'
+# size and mtime makes a data refresh invalidate the cache on its own, instead of
+# needing the app restarted or the cache cleared by hand.
+def data_signature(*paths):
+    signature = []
+    for path in paths:
+        try:
+            stat = os.stat(path)
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            signature.append((path, None, None))
+    return tuple(signature)
+
+
 @st.cache_data
-def load_data():
+def load_data(signature):
     stats = pd.read_csv('boxscores.csv')
     meta = pd.read_csv('boxscores_final.csv')
     try:
@@ -293,7 +311,7 @@ def load_data():
 
 
 @st.cache_data
-def load_upcoming_schedule():
+def load_upcoming_schedule(signature):
     try:
         schedule = pd.read_csv('schedule_upcoming.csv')
     except FileNotFoundError:
@@ -489,7 +507,8 @@ MARKET_CHIPS = {
 # APP
 # ---------------------------------------------------------------------------
 def main():
-    df = load_data()
+    df = load_data(data_signature('boxscores.csv', 'boxscores_final.csv',
+                                  'players.csv', 'rosters.csv'))
     if df is None or df.empty:
         st.error("No data available.")
         return
@@ -497,7 +516,7 @@ def main():
     st.sidebar.button("Reset all filters", on_click=reset_filters, use_container_width=True)
 
     # --- PLAYER POOL (all players, or only those playing on the next game day) ---
-    schedule_upcoming = load_upcoming_schedule()
+    schedule_upcoming = load_upcoming_schedule(data_signature('schedule_upcoming.csv'))
     next_game_date, next_day_games = get_next_game_day(schedule_upcoming)
     active_team_codes = set()
     pool_choice = "all"
