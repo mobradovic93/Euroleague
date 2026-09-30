@@ -1,4 +1,5 @@
 import os
+import math
 
 import streamlit as st
 import pandas as pd
@@ -819,10 +820,14 @@ def main():
 
     sel_min = None
     if not pdf.empty:
-        mn, mx = int(pdf['Minutes_Numeric'].min()), int(pdf['Minutes_Numeric'].max())
+        # floor/ceil, not int(): minutes are fractional (25:58 -> 25.97), and truncating
+        # the max made the default full-range filter drop each player's longest game.
+        mn = math.floor(pdf['Minutes_Numeric'].min())
+        mx = math.ceil(pdf['Minutes_Numeric'].max())
         if mn < mx:
             sel_min = st.sidebar.slider("Minutes played:", mn, mx, (mn, mx), key="sb_minutes")
-            pdf = pdf[pdf['Minutes_Numeric'].between(*sel_min)]
+            if sel_min != (mn, mx):
+                pdf = pdf[pdf['Minutes_Numeric'].between(*sel_min)]
 
     sel_margin = None
     margins = pdf['ScoreMargin'].dropna()
